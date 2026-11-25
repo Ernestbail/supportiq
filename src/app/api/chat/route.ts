@@ -1,8 +1,7 @@
-
 import { runSupportAgent } from "@/lib/agent/orchestrator";
 
 export async function POST(request: Request) {
-  let body: { question?: string };
+  let body: { question?: unknown };
 
   try {
     body = await request.json();
@@ -24,15 +23,16 @@ export async function POST(request: Request) {
 
   const encoder = new TextEncoder();
 
-  const stream = new ReadableStream({
+  const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const startTime = Date.now();
+
       const trace: Array<{
         timestamp: string;
-        event: object;
+        event: string;
       }> = [];
 
-      const send = (data: object) => {
+      const send = (data: Record<string, unknown>) => {
         controller.enqueue(
           encoder.encode(`data: ${JSON.stringify(data)}\n\n`)
         );
@@ -78,6 +78,8 @@ export async function POST(request: Request) {
       } catch (error) {
         const latencyMs = Date.now() - startTime;
 
+        console.error("SupportIQ agent error:", error);
+
         send({
           type: "error",
           error: "The support agent encountered an unexpected error.",
@@ -95,7 +97,7 @@ export async function POST(request: Request) {
 
   return new Response(stream, {
     headers: {
-      "Content-Type": "text/event-stream",
+      "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
     },

@@ -1,4 +1,3 @@
-
 "use client";
 
 import { useRef, useState } from "react";
@@ -304,7 +303,12 @@ export default function Home() {
       const decoder = new TextDecoder();
 
       let buffer = "";
-      let finalResult: AgentResult | null = null;
+
+      // Use a mutable ref so TypeScript can track the result
+      // assigned inside the streaming event handler.
+      const finalResult: { current: AgentResult | null } = {
+        current: null,
+      };
 
       function handleEvent(frame: string) {
         const dataLine = frame
@@ -320,7 +324,7 @@ export default function Home() {
         }
 
         if (payload.type === "result") {
-          finalResult = payload as AgentResult;
+          finalResult.current = payload as AgentResult;
         }
 
         if (payload.type === "error") {
@@ -349,11 +353,11 @@ export default function Home() {
         handleEvent(buffer);
       }
 
-      if (!finalResult) {
+      const result = finalResult.current;
+
+      if (!result) {
         throw new Error("The agent did not return a final response.");
       }
-
-      const result = finalResult;
 
       setToolsUsed(result.toolsUsed);
 
