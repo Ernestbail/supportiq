@@ -1,6 +1,11 @@
 
 import { QdrantClient } from "@qdrant/js-client-rest";
-import { pipeline } from "@huggingface/transformers";
+import { env, pipeline } from "@huggingface/transformers";
+
+// Vercel serverless functions must use a writable directory.
+env.cacheDir = process.env.VERCEL
+  ? "/tmp/supportiq-hf-cache"
+  : ".cache";
 
 const COLLECTION_NAME = "supportiq_knowledge";
 const MODEL_NAME = "onnx-community/all-MiniLM-L6-v2-ONNX";
