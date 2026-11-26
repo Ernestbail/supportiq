@@ -1,3 +1,4 @@
+
 "use client";
 
 import { useRef, useState } from "react";
@@ -5,6 +6,18 @@ import { useRef, useState } from "react";
 type Message = {
   role: "user" | "assistant";
   content: string;
+};
+
+type AgentConversationState = {
+  pendingRefund: boolean;
+  lastRefundOutcome?: {
+    orderId: string;
+    status: "approved" | "denied";
+    reason: string;
+    amount?: number;
+    escalated: boolean;
+    escalationCreated: boolean;
+  };
 };
 
 type ObservabilityData = {
@@ -26,6 +39,7 @@ type AgentResult = {
   events: string[];
   escalated: boolean;
   toolsUsed: number;
+  conversationState?: AgentConversationState;
   observability?: ObservabilityData;
 };
 
@@ -68,7 +82,12 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [toolsUsed, setToolsUsed] = useState(0);
   const [escalations, setEscalations] = useState(0);
-  const [pendingRefund, setPendingRefund] = useState(false);
+
+  const [conversationState, setConversationState] =
+    useState<AgentConversationState>({
+      pendingRefund: false,
+    });
+
   const [listening, setListening] = useState(false);
   const [voiceSupported, setVoiceSupported] = useState(true);
   const [observability, setObservability] =
@@ -186,7 +205,6 @@ export default function Home() {
     setInput("");
 
     const normalized = question.toLowerCase();
-
     const orderMatch = question.match(/ORD-\d+/i);
     const hasOrderNumber = Boolean(orderMatch);
 
@@ -205,7 +223,13 @@ export default function Home() {
         question
       );
 
-    if (pendingRefund && isAcknowledgement) {
+    let effectiveQuestion = question;
+
+    let requestState: AgentConversationState = {
+      ...conversationState,
+    };
+
+    if (conversationState.pendingRefund && isAcknowledgement) {
       const answer =
         "No problem. I'm still waiting for your order number (for example, ORD-5001) so I can continue with your refund request.";
 
@@ -224,8 +248,13 @@ export default function Home() {
       return;
     }
 
-    if (pendingRefund && isCancellation) {
-      setPendingRefund(false);
+    if (conversationState.pendingRefund && isCancellation) {
+      requestState = {
+        ...conversationState,
+        pendingRefund: false,
+      };
+
+      setConversationState(requestState);
 
       const answer =
         "No problem. I've cancelled the pending refund request. No refund was checked or processed.";
@@ -244,9 +273,7 @@ export default function Home() {
       return;
     }
 
-    let effectiveQuestion = question;
-
-    if (pendingRefund && hasOrderNumber) {
+    if (conversationState.pendingRefund && hasOrderNumber) {
       effectiveQuestion = `I need a refund for ${orderMatch![0]}`;
 
       setActivities([
@@ -255,9 +282,10 @@ export default function Home() {
         `Order number received: ${orderMatch![0].toUpperCase()}`,
         "Resuming refund workflow...",
       ]);
-
-      setPendingRefund(false);
-    } else if (pendingRefund && !isDifferentIntent) {
+    } else if (
+      conversationState.pendingRefund &&
+      !isDifferentIntent
+    ) {
       const answer =
         "I still need your order number to continue with the refund request. For example, ORD-5001.";
 
@@ -274,13 +302,21 @@ export default function Home() {
 
       speakResponse(answer);
       return;
-    } else if (pendingRefund && isDifferentIntent) {
-      setPendingRefund(false);
+    } else if (
+      conversationState.pendingRefund &&
+      isDifferentIntent
+    ) {
+      requestState = {
+        ...conversationState,
+        pendingRefund: false,
+      };
+
+      setConversationState(requestState);
     }
 
     setLoading(true);
 
-    if (!pendingRefund || isDifferentIntent) {
+    if (!conversationState.pendingRefund || isDifferentIntent) {
       setActivities(["Connecting to SupportIQ agent..."]);
     }
 
@@ -292,6 +328,7 @@ export default function Home() {
         },
         body: JSON.stringify({
           question: effectiveQuestion,
+          conversationState: requestState,
         }),
       });
 
@@ -304,8 +341,6 @@ export default function Home() {
 
       let buffer = "";
 
-      // Use a mutable ref so TypeScript can track the result
-      // assigned inside the streaming event handler.
       const finalResult: { current: AgentResult | null } = {
         current: null,
       };
@@ -320,7 +355,10 @@ export default function Home() {
         const payload = JSON.parse(dataLine.slice(5).trim());
 
         if (payload.type === "event") {
-          setActivities((prev) => [...prev, payload.event]);
+          setActivities((prev) => [
+            ...prev,
+            payload.event,
+          ]);
         }
 
         if (payload.type === "result") {
@@ -369,15 +407,20 @@ export default function Home() {
         setEscalations((prev) => prev + 1);
       }
 
-      if (/please provide your order number/i.test(result.answer)) {
-        setPendingRefund(true);
+      if (result.conversationState) {
+        setConversationState(result.conversationState);
+      } else {
+        setConversationState(requestState);
+      }
 
+      if (
+        result.conversationState?.pendingRefund ||
+        /please provide your order number/i.test(result.answer)
+      ) {
         setActivities((prev) => [
           ...prev,
           "Conversation memory saved: pending refund request",
         ]);
-      } else {
-        setPendingRefund(false);
       }
 
       setMessages((prev) => [
@@ -477,7 +520,7 @@ export default function Home() {
                   Streaming chat and browser-based voice prototype
                 </p>
 
-                {pendingRefund && (
+                {conversationState.pendingRefund && (
                   <p className="mt-3 text-xs text-blue-400">
                     ● Remembering: waiting for refund order number
                   </p>
@@ -532,7 +575,7 @@ export default function Home() {
                   placeholder={
                     listening
                       ? "Your spoken words will appear here..."
-                      : pendingRefund
+                      : conversationState.pendingRefund
                         ? "Enter your order number, e.g. ORD-5001"
                         : "Try: I need a refund for ORD-5001"
                   }
@@ -633,7 +676,9 @@ export default function Home() {
               </div>
 
               <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5">
-                <h3 className="font-semibold">Observability</h3>
+                <h3 className="font-semibold">
+                  Observability
+                </h3>
 
                 <p className="mt-2 text-xs text-slate-400">
                   Latest agent execution trace
@@ -645,27 +690,21 @@ export default function Home() {
                       <span className="text-slate-400">
                         Execution time
                       </span>
-                      <span>
-                        {observability.latencyMs} ms
-                      </span>
+                      <span>{observability.latencyMs} ms</span>
                     </div>
 
                     <div className="flex justify-between">
                       <span className="text-slate-400">
                         Activity events
                       </span>
-                      <span>
-                        {observability.eventCount}
-                      </span>
+                      <span>{observability.eventCount}</span>
                     </div>
 
                     <div className="flex justify-between">
                       <span className="text-slate-400">
                         Tools used
                       </span>
-                      <span>
-                        {observability.toolsUsed}
-                      </span>
+                      <span>{observability.toolsUsed}</span>
                     </div>
 
                     <div className="flex justify-between">
@@ -701,9 +740,7 @@ export default function Home() {
                       <span className="text-slate-400">
                         Execution mode
                       </span>
-                      <span>
-                        {observability.executionMode}
-                      </span>
+                      <span>{observability.executionMode}</span>
                     </div>
 
                     <div className="border-t border-slate-700 pt-4">

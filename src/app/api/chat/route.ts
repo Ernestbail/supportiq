@@ -1,7 +1,56 @@
-import { runSupportAgent } from "@/lib/agent/orchestrator";
+
+import {
+  runSupportAgent,
+  type AgentConversationState,
+} from "@/lib/agent/orchestrator";
+
+function readConversationState(value: unknown): AgentConversationState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { pendingRefund: false };
+  }
+
+  const state = value as Record<string, unknown>;
+
+  const pendingRefund = state.pendingRefund === true;
+  const outcome = state.lastRefundOutcome;
+
+  if (!outcome || typeof outcome !== "object" || Array.isArray(outcome)) {
+    return { pendingRefund };
+  }
+
+  const candidate = outcome as Record<string, unknown>;
+
+  if (
+    typeof candidate.orderId !== "string" ||
+    (candidate.status !== "approved" && candidate.status !== "denied") ||
+    typeof candidate.reason !== "string" ||
+    typeof candidate.escalated !== "boolean" ||
+    typeof candidate.escalationCreated !== "boolean"
+  ) {
+    return { pendingRefund };
+  }
+
+  return {
+    pendingRefund,
+    lastRefundOutcome: {
+      orderId: candidate.orderId,
+      status: candidate.status,
+      reason: candidate.reason,
+      escalated: candidate.escalated,
+      escalationCreated: candidate.escalationCreated,
+      ...(typeof candidate.amount === "number" &&
+      Number.isFinite(candidate.amount)
+        ? { amount: candidate.amount }
+        : {}),
+    },
+  };
+}
 
 export async function POST(request: Request) {
-  let body: { question?: unknown };
+  let body: {
+    question?: unknown;
+    conversationState?: unknown;
+  };
 
   try {
     body = await request.json();
@@ -20,6 +69,10 @@ export async function POST(request: Request) {
       { status: 400 }
     );
   }
+
+  const conversationState = readConversationState(
+    body.conversationState
+  );
 
   const encoder = new TextEncoder();
 
@@ -54,7 +107,8 @@ export async function POST(request: Request) {
               event,
               timestamp,
             });
-          }
+          },
+          conversationState
         );
 
         const latencyMs = Date.now() - startTime;

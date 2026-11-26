@@ -1,4 +1,6 @@
 
+import { searchKnowledgeBase } from "../vector/vector-search";
+
 import {
   verifyCustomer,
   getSubscription,
@@ -8,185 +10,44 @@ import {
 
 type AgentEvent = string;
 
+type PolicyCategory =
+  | "refund"
+  | "account"
+  | "subscription"
+  | "technical";
+
+export type AgentConversationState = {
+  pendingRefund: boolean;
+  lastRefundOutcome?: {
+    orderId: string;
+    status: "approved" | "denied";
+    reason: string;
+    amount?: number;
+    escalated: boolean;
+    escalationCreated: boolean;
+  };
+};
+
 export type AgentResult = {
   answer: string;
   events: AgentEvent[];
   escalated: boolean;
   toolsUsed: number;
+  conversationState?: AgentConversationState;
 };
 
-type PolicyDocument = {
-  id: string;
-  title: string;
-  content: string;
-  keywords: string[];
-};
-
-const policyDocuments: PolicyDocument[] = [
-  {
-    id: "refund-policy",
-    title: "Refund Policy",
-    content:
-      "Customers may request a refund within 30 days of purchase. The original payment must be completed. Refund requests outside the 30-day window require human review. Refunds are subject to customer identity verification and order ownership checks.",
-    keywords: [
-      "refund",
-      "money",
-      "back",
-      "payment",
-      "return",
-      "reimbursement",
-      "purchase",
-      "order",
-    ],
-  },
-  {
-    id: "identity-policy",
-    title: "Identity Verification Policy",
-    content:
-      "Customer identity must be verified and the account must be active before account changes, refunds, or other sensitive actions can be performed. Unverified or suspended accounts must be escalated for human review.",
-    keywords: [
-      "identity",
-      "verification",
-      "verify",
-      "customer",
-      "account",
-      "access",
-      "security",
-    ],
-  },
-  {
-    id: "subscription-policy",
-    title: "Subscription Policy",
-    content:
-      "Customers can ask about their subscription plan, monthly price, and account status. Billing problems, failed payments, and past-due subscriptions may require additional verification or human review.",
-    keywords: [
-      "subscription",
-      "plan",
-      "billing",
-      "price",
-      "monthly",
-      "payment",
-      "upgrade",
-      "downgrade",
-    ],
-  },
-  {
-    id: "technical-policy",
-    title: "Technical Support Policy",
-    content:
-      "For technical problems, collect the affected feature, error message, and troubleshooting steps already attempted. Issues that cannot be resolved with the available support guidance should be escalated to a human support representative.",
-    keywords: [
-      "technical",
-      "problem",
-      "broken",
-      "error",
-      "failed",
-      "troubleshooting",
-      "issue",
-      "not working",
-    ],
-  },
-];
-
-const stopWords = new Set([
-  "a",
-  "an",
-  "and",
-  "are",
-  "can",
-  "could",
-  "do",
-  "for",
-  "get",
-  "help",
-  "i",
-  "in",
-  "is",
-  "it",
-  "me",
-  "my",
-  "of",
-  "on",
-  "please",
-  "the",
-  "to",
-  "with",
-  "would",
-  "you",
-  "your",
-  "need",
-  "want",
-]);
-
-const synonyms: Record<string, string[]> = {
-  refund: ["refund", "money", "back", "reimbursement", "return"],
-  money: ["money", "refund", "payment", "reimbursement"],
-  paid: ["paid", "payment", "purchase", "billing"],
-  payment: ["payment", "paid", "billing", "purchase"],
-  return: ["return", "refund", "reimbursement"],
-  verify: ["verify", "verification", "identity", "customer"],
-  account: ["account", "customer", "identity", "subscription"],
-  subscription: ["subscription", "plan", "monthly"],
-  billing: ["billing", "payment", "paid", "subscription"],
-  technical: ["technical", "problem", "issue", "troubleshooting"],
-  problem: ["problem", "issue", "error", "broken"],
-  broken: ["broken", "error", "problem", "issue"],
-  failed: ["failed", "failure", "error", "payment"],
-};
-
-function retrievePolicy(question: string) {
-  const cleanedQuestion = question
-    .replace(/CUS-\d+/gi, "")
-    .replace(/ORD-\d+/gi, "");
-
-  const terms =
-    cleanedQuestion
-      .toLowerCase()
-      .match(/[a-z]+/g)
-      ?.filter((term) => !stopWords.has(term)) ?? [];
-
-  if (terms.length === 0) {
-    return {
-      document: null,
-      score: 0,
-    };
-  }
-
-  const rankedDocuments = policyDocuments.map((document) => {
-    const searchableText =
-      `${document.title} ${document.content} ${document.keywords.join(" ")}`
-        .toLowerCase();
-
-    const matchedTerms = terms.filter((term) => {
-      const relatedTerms = synonyms[term] ?? [term];
-
-      return relatedTerms.some(
-        (relatedTerm) =>
-          searchableText.includes(relatedTerm) ||
-          document.keywords.includes(relatedTerm)
-      );
-    });
-
-    return {
-      document,
-      score: matchedTerms.length / terms.length,
-    };
-  });
-
-  rankedDocuments.sort((a, b) => b.score - a.score);
-
-  return rankedDocuments[0] ?? {
-    document: null,
-    score: 0,
-  };
-}
+const MINIMUM_SIMILARITY_SCORE = 0.15;
 
 export async function runSupportAgent(
   question: string,
-  onEvent?: (event: string) => void
+  onEvent?: (event: string) => void,
+  conversationState?: AgentConversationState
 ): Promise<AgentResult> {
   const events: AgentEvent[] = [];
   let toolsUsed = 0;
+
+  const currentState: AgentConversationState =
+    conversationState ?? { pendingRefund: false };
 
   const addEvent = (event: string) => {
     events.push(event);
@@ -204,22 +65,22 @@ export async function runSupportAgent(
   const orderId = orderMatch?.[0].toUpperCase();
 
   const isRefund =
-    /\brefund\b|\bmoney back\b|\breturn payment\b|\breimbursement\b/i.test(
+    /\brefund\b|\bmoney back\b|\breturn payment\b|\breimbursement\b|\bmoney returned\b/i.test(
       question
     );
 
   const isSubscription =
-    /\bsubscription\b|\bplan\b|\bmonthly price\b|\bupgrade\b|\bdowngrade\b|\bbilling\b/i.test(
+    /\bsubscription\b|\bplan\b|\bmonthly price\b|\bupgrade\b|\bdowngrade\b|\bbilling\b|\bbilled\b|\bcharged every month\b|\bmonthly charge\b/i.test(
       question
     );
 
   const isTechnical =
-    /\btechnical\b|\bproblem\b|\bbroken\b|\berror\b|\btroubleshooting\b|\bissue\b|\bnot working\b|\bfailed\b/i.test(
+    /\btechnical\b|\bproblem\b|\bbroken\b|\berror\b|\btroubleshooting\b|\bissue\b|\bnot working\b|\bfailed\b|\bcrash(?:es|ed|ing)?\b|\bfrozen\b|\bfreezing\b/i.test(
       question
     );
 
   const isAccountQuestion =
-    /\baccount\b|\bverify\b|\bverification\b|\bidentity\b|\baccess\b|\bsecurity\b/i.test(
+    /\baccount\b|\bverify\b|\bverification\b|\bidentity\b|\baccess\b|\bsecurity\b|\blog ?in\b|\bsign ?in\b|\bpassword\b|\bforgot password\b/i.test(
       question
     );
 
@@ -233,16 +94,11 @@ export async function runSupportAgent(
       normalizedQuestion
     );
 
-  const hasRecognizedIntent =
-    isRefund ||
-    isSubscription ||
-    isTechnical ||
-    isAccountQuestion;
-
   try {
     addEvent("Starting agent orchestration");
 
-    // Handle greetings without running support tools.
+    // Step 1: Handle greetings.
+
     if (isGreeting) {
       addEvent("Intent detected: greeting");
 
@@ -252,10 +108,12 @@ export async function runSupportAgent(
         events,
         escalated: false,
         toolsUsed,
+        conversationState: currentState,
       };
     }
 
-    // Handle acknowledgements naturally.
+    // Step 2: Handle acknowledgements.
+
     if (isAcknowledgement) {
       addEvent("Intent detected: acknowledgement");
 
@@ -265,23 +123,44 @@ export async function runSupportAgent(
         events,
         escalated: false,
         toolsUsed,
+        conversationState: currentState,
       };
     }
 
-    // Ask for clarification instead of guessing the customer's intent.
-    if (!hasRecognizedIntent) {
-      addEvent("Intent unclear; requesting clarification");
+    // Step 3: Remember and explain the previous refund decision.
+
+    const isRefundFollowUp =
+      /\b(why|explain|reason|what happened|status|update)\b/i.test(
+        normalizedQuestion
+      ) &&
+      /\b(refund|order|denied|approved|rejected)\b/i.test(
+        normalizedQuestion
+      );
+
+    if (isRefundFollowUp && currentState.lastRefundOutcome) {
+      const outcome = currentState.lastRefundOutcome;
+
+      addEvent("Conversation memory retrieved");
+      addEvent(`Previous refund decision found: ${outcome.orderId}`);
 
       return {
         answer:
-          "I'd be happy to help. Could you tell me a little more about what you need? I can help with refunds, subscriptions, account questions, or technical problems.",
+          outcome.status === "approved"
+            ? `Your refund request for ${outcome.orderId} was approved in our simulation for $${outcome.amount}. ${outcome.reason} No money was transferred.`
+            : `Your refund request for ${outcome.orderId} was not automatically approved. Reason: ${outcome.reason} ${
+                outcome.escalationCreated
+                  ? "A human support review was successfully requested."
+                  : "A human support escalation could not be created."
+              }`,
         events,
-        escalated: false,
+        escalated: outcome.escalated,
         toolsUsed,
+        conversationState: currentState,
       };
     }
 
-    // Never select an order automatically.
+    // Step 4: Never select a refund order automatically.
+
     if (isRefund && !orderId) {
       addEvent("Intent detected: refund request");
       addEvent("Waiting for customer order number");
@@ -292,14 +171,21 @@ export async function runSupportAgent(
         events,
         escalated: false,
         toolsUsed,
+        conversationState: {
+          ...currentState,
+          pendingRefund: true,
+        },
       };
     }
 
     if (!customerMatch) {
-      addEvent("Using simulated demo customer session: CUS-1001");
+      addEvent(
+        "Using simulated demo customer session: CUS-1001"
+      );
     }
 
-    // Step 1: Verify customer identity.
+    // Step 5: Verify customer identity.
+
     addEvent("Running customer verification...");
     toolsUsed++;
 
@@ -327,12 +213,14 @@ export async function runSupportAgent(
         events,
         escalated: true,
         toolsUsed,
+        conversationState: currentState,
       };
     }
 
     addEvent("Customer identity verified");
 
-    // Step 2: Check subscription.
+    // Step 6: Check subscription.
+
     addEvent("Checking subscription...");
     toolsUsed++;
 
@@ -360,6 +248,7 @@ export async function runSupportAgent(
         events,
         escalated: true,
         toolsUsed,
+        conversationState: currentState,
       };
     }
 
@@ -367,20 +256,29 @@ export async function runSupportAgent(
       `Subscription checked: ${subscription.subscription.plan} plan`
     );
 
-    // Step 3: Retrieve the relevant support policy.
-    addEvent("Searching support knowledge base...");
+    // Step 7: Retrieve support policy using vector search.
+
+    addEvent("Generating question embedding...");
+    addEvent("Searching Qdrant knowledge base...");
+
     toolsUsed++;
 
-    const policyResult = retrievePolicy(question);
-    const policy = policyResult.document;
-    const confidence = policyResult.score;
+    const policyResults = await searchKnowledgeBase(
+      question,
+      3
+    );
 
-    if (!policy || confidence < 0.4) {
+    const policy = policyResults[0];
+
+    const relevanceScore = policy?.score ?? 0;
+
+    // Reject low-relevance results rather than guessing.
+
+    if (!policy || relevanceScore < MINIMUM_SIMILARITY_SCORE) {
       addEvent(
-        `Knowledge base confidence too low: ${Math.round(
-          confidence * 100
-        )}%`
+        `Vector similarity below threshold: ${relevanceScore.toFixed(3)}`
       );
+
       addEvent("Escalating low-confidence request...");
 
       toolsUsed++;
@@ -388,7 +286,7 @@ export async function runSupportAgent(
       const escalation = await escalateToHuman(
         customerId,
         "low_confidence",
-        `The support agent could not confidently match the request to a policy. Customer question: ${question}`
+        `No sufficiently relevant support policy was found. Customer question: ${question}`
       );
 
       if (escalation.success) {
@@ -397,25 +295,73 @@ export async function runSupportAgent(
 
       return {
         answer:
-          "I couldn't confidently match your question to our support guidance. I've referred your request to a human support representative.",
+          "I couldn't find sufficiently relevant support guidance for your question. I've referred your request to a human support representative.",
         events,
         escalated: true,
         toolsUsed,
+        conversationState: currentState,
       };
     }
 
     addEvent(
-      `Policy retrieved: ${policy.id} (keyword-match score: ${Math.round(
-        confidence * 100
-      )}%)`
+      `Vector policy retrieved: ${policy.policyId} (similarity: ${relevanceScore.toFixed(3)})`
     );
 
-    // Step 4: Handle refund requests.
-    if (isRefund && orderId) {
-      addEvent(`Checking refund for order ${orderId}...`);
+    // Step 8: Determine the support category.
+
+    const detectedCategory: PolicyCategory =
+      isRefund
+        ? "refund"
+        : isSubscription
+          ? "subscription"
+          : isTechnical
+            ? "technical"
+            : isAccountQuestion
+              ? "account"
+              : policy.category;
+
+    // Prevent a mismatched policy from guiding an answer.
+
+    if (policy.category !== detectedCategory) {
+      addEvent(
+        `Policy category mismatch: expected ${detectedCategory}, received ${policy.category}`
+      );
+
+      addEvent("Escalating uncertain policy match...");
+
       toolsUsed++;
 
-      const refund = await processRefund(customerId, orderId);
+      const escalation = await escalateToHuman(
+        customerId,
+        "low_confidence",
+        `Retrieved policy category did not match the detected request category. Customer question: ${question}`
+      );
+
+      if (escalation.success) {
+        addEvent("Human support escalation created");
+      }
+
+      return {
+        answer:
+          "I found support information that may not match your request. To avoid giving you incorrect guidance, I've referred this to human support.",
+        events,
+        escalated: true,
+        toolsUsed,
+        conversationState: currentState,
+      };
+    }
+
+    // Step 9: Handle refund requests.
+
+    if (detectedCategory === "refund" && orderId) {
+      addEvent(`Checking refund for order ${orderId}...`);
+
+      toolsUsed++;
+
+      const refund = await processRefund(
+        customerId,
+        orderId
+      );
 
       if (refund.success && refund.refund) {
         addEvent("Refund eligibility approved");
@@ -426,6 +372,17 @@ export async function runSupportAgent(
           events,
           escalated: false,
           toolsUsed,
+          conversationState: {
+            pendingRefund: false,
+            lastRefundOutcome: {
+              orderId: refund.refund.orderId,
+              status: "approved",
+              reason: refund.message,
+              amount: refund.refund.amount,
+              escalated: false,
+              escalationCreated: false,
+            },
+          },
         };
       }
 
@@ -450,11 +407,22 @@ export async function runSupportAgent(
         events,
         escalated: true,
         toolsUsed,
+        conversationState: {
+          pendingRefund: false,
+          lastRefundOutcome: {
+            orderId,
+            status: "denied",
+            reason: refund.message,
+            escalated: true,
+            escalationCreated: escalation.success,
+          },
+        },
       };
     }
 
-    // Step 5: Handle subscription questions.
-    if (isSubscription) {
+    // Step 10: Handle subscription questions.
+
+    if (detectedCategory === "subscription") {
       addEvent("Preparing subscription information");
 
       return {
@@ -463,11 +431,13 @@ export async function runSupportAgent(
         events,
         escalated: false,
         toolsUsed,
+        conversationState: currentState,
       };
     }
 
-    // Step 6: Handle technical support questions.
-    if (isTechnical) {
+    // Step 11: Handle technical support questions.
+
+    if (detectedCategory === "technical") {
       addEvent("Preparing technical support guidance");
 
       return {
@@ -476,11 +446,13 @@ export async function runSupportAgent(
         events,
         escalated: false,
         toolsUsed,
+        conversationState: currentState,
       };
     }
 
-    // Step 7: Handle account questions.
-    if (isAccountQuestion) {
+    // Step 12: Handle account questions.
+
+    if (detectedCategory === "account") {
       addEvent("Preparing account support guidance");
 
       return {
@@ -489,8 +461,13 @@ export async function runSupportAgent(
         events,
         escalated: false,
         toolsUsed,
+        conversationState: currentState,
       };
     }
+
+    // Safe fallback.
+
+    addEvent("No supported response category found");
 
     return {
       answer:
@@ -498,8 +475,12 @@ export async function runSupportAgent(
       events,
       escalated: false,
       toolsUsed,
+      conversationState: currentState,
     };
+
   } catch (error) {
+    console.error("SupportIQ agent error:", error);
+
     addEvent("Agent encountered an unexpected error");
     addEvent("Using safe fallback response");
 
@@ -509,6 +490,7 @@ export async function runSupportAgent(
       events,
       escalated: false,
       toolsUsed,
+      conversationState: currentState,
     };
   }
 }
