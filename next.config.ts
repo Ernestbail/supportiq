@@ -1,9 +1,14 @@
+
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
   cacheComponents: true,
   partialPrefetching: true,
+
+  outputFileTracingIncludes: {
+    "/api/chat": ["./node_modules/onnxruntime-node/**/*"],
+  },
+
   turbopack: {
     rules: {
       "*.css": {
