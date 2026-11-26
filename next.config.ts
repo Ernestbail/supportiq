@@ -1,4 +1,3 @@
-
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
@@ -6,7 +5,10 @@ const nextConfig: NextConfig = {
   partialPrefetching: true,
 
   outputFileTracingIncludes: {
-    "/api/chat": ["./node_modules/onnxruntime-node/**/*"],
+    "/api/chat": [
+      "./node_modules/onnxruntime-node/**/*",
+      "./node_modules/onnxruntime-common/**/*",
+    ],
   },
 
   turbopack: {
