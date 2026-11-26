@@ -10,14 +10,14 @@ type Message = {
 
 type AgentConversationState = {
   pendingRefund: boolean;
-  lastRefundOutcome?: {
+  refundOutcomes: {
     orderId: string;
     status: "approved" | "denied";
     reason: string;
     amount?: number;
     escalated: boolean;
     escalationCreated: boolean;
-  };
+  }[];
 };
 
 type ObservabilityData = {
@@ -84,9 +84,10 @@ export default function Home() {
   const [escalations, setEscalations] = useState(0);
 
   const [conversationState, setConversationState] =
-    useState<AgentConversationState>({
-      pendingRefund: false,
-    });
+  useState<AgentConversationState>({
+    pendingRefund: false,
+    refundOutcomes: [],
+  });
 
   const [listening, setListening] = useState(false);
   const [voiceSupported, setVoiceSupported] = useState(true);

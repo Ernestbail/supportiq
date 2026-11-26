@@ -6,43 +6,54 @@ import {
 
 function readConversationState(value: unknown): AgentConversationState {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return { pendingRefund: false };
+    return {
+      pendingRefund: false,
+      refundOutcomes: [],
+    };
   }
 
   const state = value as Record<string, unknown>;
-
   const pendingRefund = state.pendingRefund === true;
-  const outcome = state.lastRefundOutcome;
 
-  if (!outcome || typeof outcome !== "object" || Array.isArray(outcome)) {
-    return { pendingRefund };
-  }
+  const rawOutcomes = Array.isArray(state.refundOutcomes)
+    ? state.refundOutcomes
+    : [];
 
-  const candidate = outcome as Record<string, unknown>;
+  const refundOutcomes = rawOutcomes
+    .filter((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return false;
+      }
 
-  if (
-    typeof candidate.orderId !== "string" ||
-    (candidate.status !== "approved" && candidate.status !== "denied") ||
-    typeof candidate.reason !== "string" ||
-    typeof candidate.escalated !== "boolean" ||
-    typeof candidate.escalationCreated !== "boolean"
-  ) {
-    return { pendingRefund };
-  }
+      const candidate = item as Record<string, unknown>;
+
+      return (
+        typeof candidate.orderId === "string" &&
+        (candidate.status === "approved" || candidate.status === "denied") &&
+        typeof candidate.reason === "string" &&
+        typeof candidate.escalated === "boolean" &&
+        typeof candidate.escalationCreated === "boolean"
+      );
+    })
+    .map((item) => {
+      const candidate = item as Record<string, unknown>;
+
+      return {
+        orderId: candidate.orderId as string,
+        status: candidate.status as "approved" | "denied",
+        reason: candidate.reason as string,
+        escalated: candidate.escalated as boolean,
+        escalationCreated: candidate.escalationCreated as boolean,
+        ...(typeof candidate.amount === "number" &&
+        Number.isFinite(candidate.amount)
+          ? { amount: candidate.amount }
+          : {}),
+      };
+    });
 
   return {
     pendingRefund,
-    lastRefundOutcome: {
-      orderId: candidate.orderId,
-      status: candidate.status,
-      reason: candidate.reason,
-      escalated: candidate.escalated,
-      escalationCreated: candidate.escalationCreated,
-      ...(typeof candidate.amount === "number" &&
-      Number.isFinite(candidate.amount)
-        ? { amount: candidate.amount }
-        : {}),
-    },
+    refundOutcomes,
   };
 }
 

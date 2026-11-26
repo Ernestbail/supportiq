@@ -1,4 +1,3 @@
-
 import { searchKnowledgeBase } from "../vector/vector-search";
 
 import {
@@ -16,16 +15,18 @@ type PolicyCategory =
   | "subscription"
   | "technical";
 
+export type RefundOutcome = {
+  orderId: string;
+  status: "approved" | "denied";
+  reason: string;
+  amount?: number;
+  escalated: boolean;
+  escalationCreated: boolean;
+};
+
 export type AgentConversationState = {
   pendingRefund: boolean;
-  lastRefundOutcome?: {
-    orderId: string;
-    status: "approved" | "denied";
-    reason: string;
-    amount?: number;
-    escalated: boolean;
-    escalationCreated: boolean;
-  };
+  refundOutcomes: RefundOutcome[];
 };
 
 export type AgentResult = {
@@ -47,7 +48,10 @@ export async function runSupportAgent(
   let toolsUsed = 0;
 
   const currentState: AgentConversationState =
-    conversationState ?? { pendingRefund: false };
+    conversationState ?? {
+      pendingRefund: false,
+      refundOutcomes: [],
+    };
 
   const addEvent = (event: string) => {
     events.push(event);
@@ -85,12 +89,17 @@ export async function runSupportAgent(
     );
 
   const isGreeting =
-    /^(hi|hello|hey|good morning|good afternoon|good evening|howdy)[!.?\s]*$/i.test(
+    /^(hi|hello|hey|good morning|good afternoon|good evening|howdy)(\s+(there|how are you|how's it going|how are things))?[!.?,\s]*$/i.test(
       normalizedQuestion
     );
 
   const isAcknowledgement =
     /^(ok|okay|alright|all right|got it|understood|thanks|thank you|thank you so much|great|perfect|cool|sure)[!.?\s]*$/i.test(
+      normalizedQuestion
+    );
+
+  const isHumanRequest =
+    /\b(speak to|talk to|connect me to|transfer me to|let me speak to|let me talk to)\b.{0,40}\b(human|person|representative|agent|support)\b|\b(live agent|human representative|real person|human support representative)\b/i.test(
       normalizedQuestion
     );
 
@@ -127,7 +136,36 @@ export async function runSupportAgent(
       };
     }
 
-    // Step 3: Remember and explain the previous refund decision.
+    // Step 3: Handle explicit requests for human support.
+
+    if (isHumanRequest) {
+      addEvent("Customer requested a human representative");
+      addEvent("Creating human support escalation...");
+
+      toolsUsed++;
+
+      const escalation = await escalateToHuman(
+        customerId,
+        "customer_request",
+        `Customer requested human support. Request: ${question}`
+      );
+
+      if (escalation.success) {
+        addEvent("Human support escalation created");
+      }
+
+      return {
+        answer: escalation.success
+          ? "I've successfully created a request for a human support representative to assist you."
+          : "I couldn't create the human support request right now. Please try again.",
+        events,
+        escalated: escalation.success,
+        toolsUsed,
+        conversationState: currentState,
+      };
+    }
+
+    // Step 4: Remember and explain previous refund decisions.
 
     const isRefundFollowUp =
       /\b(why|explain|reason|what happened|status|update)\b/i.test(
@@ -137,29 +175,69 @@ export async function runSupportAgent(
         normalizedQuestion
       );
 
-    if (isRefundFollowUp && currentState.lastRefundOutcome) {
-      const outcome = currentState.lastRefundOutcome;
+    if (isRefundFollowUp) {
+      const requestedOrder = question.match(/ORD-\d+/i)?.[0].toUpperCase();
 
-      addEvent("Conversation memory retrieved");
-      addEvent(`Previous refund decision found: ${outcome.orderId}`);
+      let matchingOutcomes = currentState.refundOutcomes;
+
+      if (requestedOrder) {
+        matchingOutcomes = matchingOutcomes.filter(
+          (outcome) => outcome.orderId === requestedOrder
+        );
+      } else if (/\bapproved\b/i.test(normalizedQuestion)) {
+        matchingOutcomes = matchingOutcomes.filter(
+          (outcome) => outcome.status === "approved"
+        );
+      } else if (/\bdenied\b|\brejected\b/i.test(normalizedQuestion)) {
+        matchingOutcomes = matchingOutcomes.filter(
+          (outcome) => outcome.status === "denied"
+        );
+      }
+
+      if (matchingOutcomes.length === 1) {
+        const outcome = matchingOutcomes[0];
+
+        addEvent("Conversation memory retrieved");
+        addEvent(`Previous refund decision found: ${outcome.orderId}`);
+
+        return {
+          answer:
+            outcome.status === "approved"
+              ? `Your refund request for ${outcome.orderId} was approved in our simulation for $${outcome.amount}. ${outcome.reason} No money was transferred.`
+              : `Your refund request for ${outcome.orderId} was not automatically approved. Reason: ${outcome.reason} ${
+                  outcome.escalationCreated
+                    ? "A human support review was successfully requested."
+                    : "A human support escalation could not be created."
+                }`,
+          events,
+          escalated: outcome.escalated,
+          toolsUsed,
+          conversationState: currentState,
+        };
+      }
+
+      if (matchingOutcomes.length > 1) {
+        return {
+          answer:
+            "I found multiple refund decisions. Which order number are you asking about?",
+          events,
+          escalated: false,
+          toolsUsed,
+          conversationState: currentState,
+        };
+      }
 
       return {
         answer:
-          outcome.status === "approved"
-            ? `Your refund request for ${outcome.orderId} was approved in our simulation for $${outcome.amount}. ${outcome.reason} No money was transferred.`
-            : `Your refund request for ${outcome.orderId} was not automatically approved. Reason: ${outcome.reason} ${
-                outcome.escalationCreated
-                  ? "A human support review was successfully requested."
-                  : "A human support escalation could not be created."
-              }`,
+          "I couldn't find a matching previous refund decision. Please provide the order number so I can check it.",
         events,
-        escalated: outcome.escalated,
+        escalated: false,
         toolsUsed,
         conversationState: currentState,
       };
     }
 
-    // Step 4: Never select a refund order automatically.
+    // Step 5: Ask for an order number before checking a refund.
 
     if (isRefund && !orderId) {
       addEvent("Intent detected: refund request");
@@ -178,13 +256,34 @@ export async function runSupportAgent(
       };
     }
 
+    // Step 6: Clarify messages that do not identify a support topic.
+
+    if (
+      !isRefund &&
+      !isSubscription &&
+      !isTechnical &&
+      !isAccountQuestion
+    ) {
+      addEvent("No supported intent detected");
+      addEvent("Requesting clarification");
+
+      return {
+        answer:
+          "I'd be happy to help! Are you asking about a refund, your subscription, account access, or a technical problem?",
+        events,
+        escalated: false,
+        toolsUsed,
+        conversationState: currentState,
+      };
+    }
+
     if (!customerMatch) {
       addEvent(
         "Using simulated demo customer session: CUS-1001"
       );
     }
 
-    // Step 5: Verify customer identity.
+    // Step 7: Verify customer identity.
 
     addEvent("Running customer verification...");
     toolsUsed++;
@@ -219,7 +318,7 @@ export async function runSupportAgent(
 
     addEvent("Customer identity verified");
 
-    // Step 6: Check subscription.
+    // Step 8: Check subscription.
 
     addEvent("Checking subscription...");
     toolsUsed++;
@@ -256,7 +355,7 @@ export async function runSupportAgent(
       `Subscription checked: ${subscription.subscription.plan} plan`
     );
 
-    // Step 7: Retrieve support policy using vector search.
+    // Step 9: Retrieve support policy using vector search.
 
     addEvent("Generating question embedding...");
     addEvent("Searching Qdrant knowledge base...");
@@ -294,10 +393,11 @@ export async function runSupportAgent(
       }
 
       return {
-        answer:
-          "I couldn't find sufficiently relevant support guidance for your question. I've referred your request to a human support representative.",
+        answer: escalation.success
+          ? "I couldn't find sufficiently relevant support guidance. I've referred your request to a human support representative."
+          : "I couldn't find sufficiently relevant support guidance, and the human support request could not be created.",
         events,
-        escalated: true,
+        escalated: escalation.success,
         toolsUsed,
         conversationState: currentState,
       };
@@ -307,18 +407,15 @@ export async function runSupportAgent(
       `Vector policy retrieved: ${policy.policyId} (similarity: ${relevanceScore.toFixed(3)})`
     );
 
-    // Step 8: Determine the support category.
+    // Step 10: Determine the support category.
 
-    const detectedCategory: PolicyCategory =
-      isRefund
-        ? "refund"
-        : isSubscription
-          ? "subscription"
-          : isTechnical
-            ? "technical"
-            : isAccountQuestion
-              ? "account"
-              : policy.category;
+    const detectedCategory: PolicyCategory = isRefund
+      ? "refund"
+      : isSubscription
+        ? "subscription"
+        : isTechnical
+          ? "technical"
+          : "account";
 
     // Prevent a mismatched policy from guiding an answer.
 
@@ -342,16 +439,17 @@ export async function runSupportAgent(
       }
 
       return {
-        answer:
-          "I found support information that may not match your request. To avoid giving you incorrect guidance, I've referred this to human support.",
+        answer: escalation.success
+          ? "I found support information that may not match your request. To avoid giving you incorrect guidance, I've referred this to human support."
+          : "I found support information that may not match your request, and I couldn't create a human support escalation.",
         events,
-        escalated: true,
+        escalated: escalation.success,
         toolsUsed,
         conversationState: currentState,
       };
     }
 
-    // Step 9: Handle refund requests.
+    // Step 11: Handle refund requests.
 
     if (detectedCategory === "refund" && orderId) {
       addEvent(`Checking refund for order ${orderId}...`);
@@ -366,6 +464,22 @@ export async function runSupportAgent(
       if (refund.success && refund.refund) {
         addEvent("Refund eligibility approved");
 
+        const newOutcome: RefundOutcome = {
+          orderId: refund.refund.orderId,
+          status: "approved",
+          reason: refund.message,
+          amount: refund.refund.amount,
+          escalated: false,
+          escalationCreated: false,
+        };
+
+        const updatedOutcomes = [
+          ...currentState.refundOutcomes.filter(
+            (outcome) => outcome.orderId !== newOutcome.orderId
+          ),
+          newOutcome,
+        ];
+
         return {
           answer:
             `${refund.message} Order: ${refund.refund.orderId}. Amount: $${refund.refund.amount}.`,
@@ -374,14 +488,7 @@ export async function runSupportAgent(
           toolsUsed,
           conversationState: {
             pendingRefund: false,
-            lastRefundOutcome: {
-              orderId: refund.refund.orderId,
-              status: "approved",
-              reason: refund.message,
-              amount: refund.refund.amount,
-              escalated: false,
-              escalationCreated: false,
-            },
+            refundOutcomes: updatedOutcomes,
           },
         };
       }
@@ -401,26 +508,36 @@ export async function runSupportAgent(
         addEvent("Human support escalation created");
       }
 
-      return {
-        answer:
-          `${refund.message} I've referred this refund request for human review.`,
-        events,
+      const deniedOutcome: RefundOutcome = {
+        orderId,
+        status: "denied",
+        reason: refund.message,
         escalated: true,
+        escalationCreated: escalation.success,
+      };
+
+      const updatedOutcomes = [
+        ...currentState.refundOutcomes.filter(
+          (outcome) => outcome.orderId !== orderId
+        ),
+        deniedOutcome,
+      ];
+
+      return {
+        answer: escalation.success
+          ? `${refund.message} I've referred this refund request for human review.`
+          : `${refund.message} I couldn't create a human support review request.`,
+        events,
+        escalated: escalation.success,
         toolsUsed,
         conversationState: {
           pendingRefund: false,
-          lastRefundOutcome: {
-            orderId,
-            status: "denied",
-            reason: refund.message,
-            escalated: true,
-            escalationCreated: escalation.success,
-          },
+          refundOutcomes: updatedOutcomes,
         },
       };
     }
 
-    // Step 10: Handle subscription questions.
+    // Step 12: Handle subscription questions.
 
     if (detectedCategory === "subscription") {
       addEvent("Preparing subscription information");
@@ -435,7 +552,7 @@ export async function runSupportAgent(
       };
     }
 
-    // Step 11: Handle technical support questions.
+    // Step 13: Handle technical support questions.
 
     if (detectedCategory === "technical") {
       addEvent("Preparing technical support guidance");
@@ -450,7 +567,7 @@ export async function runSupportAgent(
       };
     }
 
-    // Step 12: Handle account questions.
+    // Step 14: Handle account questions.
 
     if (detectedCategory === "account") {
       addEvent("Preparing account support guidance");
@@ -477,7 +594,6 @@ export async function runSupportAgent(
       toolsUsed,
       conversationState: currentState,
     };
-
   } catch (error) {
     console.error("SupportIQ agent error:", error);
 
